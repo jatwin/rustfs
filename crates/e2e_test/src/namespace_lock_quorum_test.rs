@@ -23,19 +23,24 @@ use tracing::{info, warn};
 
 const BUCKET: &str = "namespace-lock-quorum-bucket";
 const KEY: &str = "thumb/79/concurrent-overwrite.jpg";
+const IDENTICAL_KEY: &str = "thumb/bb/identical-content.jpg";
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
-async fn put_object(client: Client, payload: Vec<u8>, writer_id: usize) -> Result<(), String> {
+async fn put_object_at(client: Client, key: &str, payload: Vec<u8>, writer_id: usize) -> Result<(), String> {
     client
         .put_object()
         .bucket(BUCKET)
-        .key(KEY)
+        .key(key)
         .body(Bytes::from(payload).into())
         .send()
         .await
         .map(|_| ())
         .map_err(|err| format_s3_error(err, writer_id))
+}
+
+async fn put_object(client: Client, payload: Vec<u8>, writer_id: usize) -> Result<(), String> {
+    put_object_at(client, KEY, payload, writer_id).await
 }
 
 fn format_s3_error(err: SdkError<aws_sdk_s3::operation::put_object::PutObjectError>, writer_id: usize) -> String {
@@ -118,5 +123,46 @@ async fn test_concurrent_cluster_overwrites_do_not_fail_namespace_lock_quorum() 
     );
 
     clients[0].delete_object().bucket(BUCKET).key(KEY).send().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_concurrent_identical_puts_do_not_timeout_or_leave_stuck_lock() -> TestResult {
+    crate::common::init_logging();
+
+    let mut cluster = RustFSTestClusterEnvironment::new(4).await?;
+    cluster.start().await?;
+    cluster.create_test_bucket(BUCKET).await?;
+
+    let clients = cluster.create_all_clients()?;
+    let writer_count = clients.len() * 16;
+    let barrier = Arc::new(Barrier::new(writer_count));
+    let payload = vec![0x5a; 5_848];
+    let mut handles = Vec::with_capacity(writer_count);
+
+    for writer_id in 0..writer_count {
+        let client = clients[writer_id % clients.len()].clone();
+        let barrier = barrier.clone();
+        let payload = payload.clone();
+        handles.push(tokio::spawn(async move {
+            barrier.wait().await;
+            put_object_at(client, IDENTICAL_KEY, payload, writer_id).await
+        }));
+    }
+
+    let mut failures = Vec::new();
+    for handle in handles {
+        match handle.await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => failures.push(err),
+            Err(err) => failures.push(format!("writer task join failed: {err}")),
+        }
+    }
+
+    assert!(failures.is_empty(), "concurrent identical PUTs must all succeed: {failures:#?}");
+
+    put_object_at(clients[0].clone(), IDENTICAL_KEY, payload, writer_count).await?;
+    clients[0].delete_object().bucket(BUCKET).key(IDENTICAL_KEY).send().await?;
     Ok(())
 }
